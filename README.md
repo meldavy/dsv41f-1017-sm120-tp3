@@ -14,7 +14,7 @@ in VRAM, and the Engram n-gram tables live in host RAM.
 | | |
 |---|---|
 | Prefill | ~7,000 tok/s at 10k-token prompts, ~7,600 at 32k, 5,400 at 736k |
-| Decode | ~91.5 tok/s (no speculative decoding) |
+| Decode | ~91.5 tok/s without speculation; 150-260 tok/s with DSpark (see [Speculative decoding](#speculative-decoding-dspark)) |
 | Context / KV | 1,048,576-token window, 3.14M-token KV pool (3 concurrent 1M sessions) |
 
 The patches and scripts are in this repository (`patches/`, `scripts/`) and also reproduced in the appendices.
@@ -34,9 +34,10 @@ Written 2026-10-17. Everything below was measured on one machine; see *Caveats* 
 9. [Model parameters](#model-parameters)
 10. [Memory](#memory)
 11. [Speed](#speed)
-12. [Caveats](#caveats)
-13. [Credits and licenses](#credits-and-licenses)
-14. Appendices: [A vLLM patch](#appendix-a-vllm-patch) · [B kernel](#appendix-b-ds41_exl3_do-kernel-changes) ·
+12. [Speculative decoding (DSpark)](#speculative-decoding-dspark)
+13. [Caveats](#caveats)
+14. [Credits and licenses](#credits-and-licenses)
+15. Appendices: [A vLLM patch](#appendix-a-vllm-patch) · [B kernel](#appendix-b-ds41_exl3_do-kernel-changes) ·
     [C fetch script](#appendix-c-fetch_nonexpertpy) · [D assemble script](#appendix-d-assemble_hybridpy) ·
     [E glibc 2.43 workaround](#appendix-e-glibc-243--cuda-130-workaround)
 
@@ -283,7 +284,7 @@ Tuning environment variables: `DS41_EXL3_DO` (1), `DS41_EXL3_DO_TOKENS` (4096), 
 | Attention | 64 heads × 512, 1 KV head, q_lora 1280, o_lora 1024 (8 output groups), rope dim 64, sliding window 128, YaRN ×16 to 1,048,576 positions. At TP3 the fork pads to 72 heads / 9 groups, so the third GPU holds 16 real + 8 zero heads |
 | Indexer | 32 heads × 128, top-512, on layers 2, 8, 14, 20, 24, 28, 32, 36. Candidate source is layer 20 (2048 blocks × 8) |
 | MoE | 384 routed experts, top-6, plus 1 shared expert. Intermediate 2304. sqrt-softplus routing, routed scale 1.5, SwiGLU limit 10 |
-| MTP / DSpark | 3 next-n layers, 128 draft experts top-3, block 5. Shipped, **not enabled** here |
+| MTP / DSpark | 3 next-n layers, 128 draft experts top-3, block 5 (DeepSeek's MXFP4 draft experts in the hybrid). Optional, see [Speculative decoding](#speculative-decoding-dspark) |
 | Sampling (model card) | temperature 1.0, top_p 0.95 |
 
 ## Memory
@@ -325,10 +326,53 @@ What the profiler showed along the way (`--profiler-config.profiler torch`):
 - Once those were fixed, a 16k chunk is ~0.9-1.0 s of GPU work: decode-once MoE ~0.3 s, attention ~0.25 s, dense
   GEMMs ~0.15 s, mHC/norms ~0.1 s.
 
+## Speculative decoding (DSpark)
+
+DS4.1's built-in drafter is DSpark: the checkpoint's three `mtp.*` layers, with 128 MXFP4 draft experts each. On
+this vLLM fork it is the only speculative method for DS4.1. The V2 model runner has no `ngram`/`suffix` path, and
+there is no separate MTP head. It works at TP3 unchanged. To enable it, add LIL's recommended config and use
+8k chunks:
+
+```bash
+  --max-num-batched-tokens 8192 \
+  --speculative-config '{"method":"dspark","attention_backend":"B12X","draft_sample_method":"greedy","rejection_sample_method":"standard","num_speculative_tokens":7,"draft_tensor_parallel_size":3,"enable_adaptive_verification":true,"adaptive_verification_cost_scale":1.0}'
+```
+
+`--max-cudagraph-capture-size` must cover `max_num_seqs × (1 + 7)`; 24 covers 3 sequences. The first boot spends
+~8 extra minutes autotuning b12x kernels for the verify/draft shapes; the results are cached afterwards.
+
+**Comparison** (one stream, thinking off, same benchmark scripts and prompts; the DSpark column was measured warm
+in one pass):
+
+| | No speculation, 16k chunks (main recipe) | DSpark K7 (adaptive), 8k chunks |
+|---|---|---|
+| Weights per GPU | 80.35 GiB | 83.33 GiB (+2.98 GiB drafter) |
+| KV pool | **3,137,838 tokens** (2.99 × 1M) | 1,425,903 tokens (1.36 × 1M) |
+| Prefill, 10k-token prompt | **6,924-7,108 tok/s** | 4,756-4,821 tok/s (−32%) |
+| Prefill, 32k-token prompt | **7,546-7,597 tok/s** | 6,815-6,818 tok/s (−10%) |
+| Decode after 10k prompt, synthetic filler text | 91.5-91.7 tok/s | 133.7-149.9 tok/s (+46-64%) |
+| Decode after 32k prompt, synthetic filler text | 91.5-91.7 tok/s | 152.8-166.5 tok/s (+67-82%) |
+| Decode, realistic outputs: Python module + tests / Rust parser / TCP explainer / refactor (600 tokens each) | not measured | 207.6-213.3 / 240.5-260.8 / 151.5-160.4 / 178.2-189.7 tok/s |
+| Mean acceptance length | — | 2.5-4.1 tokens per verify step |
+
+Notes:
+- **KV cost:** DSpark costs ~6.4 GiB of KV per GPU at the same chunk size (8k without speculation gave 6.8M
+  tokens): ~3 GiB of drafter weights plus ~3.4 GiB of verification/draft buffers. With speculation and 16k chunks,
+  a 1M window does not fit.
+- **Prefill cost:** the drafter also processes every prompt token, and 8k chunks add one more fixed-overhead chunk
+  per 8k tokens. The hit is largest on short-to-medium prompts. Prefill at 8k chunks *without* DSpark was not
+  measured in RAM-Engram mode, so the two causes are not separated.
+- **Decode depends on content:** structured code drafts best. Without speculation, decode speed does not depend
+  on the text, so the main recipe's 91.5 tok/s should also hold for the realistic prompts, but they were not run
+  on that configuration.
+- **Which to pick:** DSpark for single-user interactive/agentic work, where decode dominates and prefix caching
+  keeps most prefills short. No speculation for several concurrent long-context sessions or bulk long-prompt
+  prefill.
+
 ## Caveats
 
-- **Not tested:** DSpark speculative decoding. It is the obvious decode lever (diffbot reports ~4.1 accepted
-  tokens per step on V4.1 agentic traffic). Capture sizes must cover `max_num_seqs × (1 + k)`.
+- **DSpark** was measured only at 8k chunks, K7 adaptive, one stream (see above). Other depths, chunk sizes and
+  concurrency are untested.
 - **Not tested:** perplexity or KL of this exact hybrid; x86 hosts; a stock build of the vLLM commit (see 3a);
   the Appendix C/D scripts in their published form. Those two are the scripts that built the tested checkpoint,
   with the paths turned into arguments; they have only been syntax-checked as published.
