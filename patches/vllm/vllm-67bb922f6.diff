@@ -1,0 +1,79 @@
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index c278cd2fa..f9413eeca 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -66,6 +66,7 @@ from ..b12x_layers import B12xLinearMethod, B12xMHC
+ from ..b12x_layers import B12xRMSNorm as RMSNorm
+ from ..ced import ced_decoder_start, gather_rows, scatter_rows
+ from ..common.engram import Engram, EngramLayout, NgramHashState
++from ..exl3_experts import parse_expert_name as parse_exl3_expert_name
+ from .b12x_attention import DeepseekV41B12xAttention
+ 
+ if typing.TYPE_CHECKING:
+@@ -691,7 +692,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # Pre-compute expert mapping ONCE.
+         expert_mapping = self.get_expert_mapping()
+ 
++        exl3_loaded_layers: set[int] = set()
+         for name, loaded_weight in weights:
++            exl3 = parse_exl3_expert_name(name) if ".experts." in name else None
++            if exl3 is not None:
++                if is_pp_missing_parameter(name, self):
++                    continue
++                layer_idx, expert_id, proj, kind = exl3
++                experts = self.layers[layer_idx].ffn.experts
++                routed = getattr(experts, "routed_experts", experts)
++                routed.quant_method.load_exl3(
++                    routed, expert_id, proj, kind, loaded_weight
++                )
++                if layer_idx not in exl3_loaded_layers:
++                    exl3_loaded_layers.add(layer_idx)
++                    loaded_params.update(
++                        n
++                        for n in params_dict
++                        if n.startswith(f"layers.{layer_idx}.ffn.experts.")
++                        and n.endswith((".w13_weight", ".w2_weight"))
++                    )
++                continue
+             if name.startswith(("vision.", "aligner.", "image_")):
+                 # Vision weights are loaded by the outer multimodal wrapper.
+                 logger.warning_once("Skipping non-text weight: %s", name)
+diff --git a/vllm/models/deepseek_v4_1/quant_config.py b/vllm/models/deepseek_v4_1/quant_config.py
+index d7a63ee88..ec7a5c751 100644
+--- a/vllm/models/deepseek_v4_1/quant_config.py
++++ b/vllm/models/deepseek_v4_1/quant_config.py
+@@ -43,5 +43,34 @@ class DeepseekV41FP8Config(Fp8Config):
+ 
+             return B12xEmbeddingMethod()
+         if isinstance(layer, RoutedExperts):
++            exl3 = _exl3_routed_expert_layers()
++            if exl3 is not None:
++                from vllm.model_executor.models.utils import extract_layer_index
++
++                index = extract_layer_index(prefix)
++                if index in exl3[0]:
++                    from .exl3_experts import DeepseekV41Exl3ExpertsMethod
++
++                    return DeepseekV41Exl3ExpertsMethod(
++                        layer.moe_config, index, exl3[1]
++                    )
+             return Mxfp4MoEMethod(layer.moe_config)
+         return None
++
++
++def _exl3_routed_expert_layers() -> tuple[frozenset[int], float] | None:
++    """Layers whose routed experts a hybrid checkpoint stores as EXL3.
++
++    Declared under ``quantization_config.exl3_routed_experts`` (``layers``:
++    list of target layer indices). Every other tensor keeps the native format.
++    """
++    from vllm.config import get_current_vllm_config
++
++    model_config = get_current_vllm_config().model_config
++    for cfg in (model_config.hf_config, model_config.hf_text_config):
++        quant = getattr(cfg, "quantization_config", None) or {}
++        spec = quant.get("exl3_routed_experts") if isinstance(quant, dict) else None
++        if spec:
++            limit = getattr(model_config.hf_text_config, "swiglu_limit", 0.0) or 0.0
++            return frozenset(int(i) for i in spec["layers"]), float(limit)
++    return None

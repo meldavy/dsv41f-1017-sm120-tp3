@@ -1,0 +1,108 @@
+--- a/do_gemm.cu
++++ b/do_gemm.cu
+@@ -1,4 +1,6 @@
+-// Copyright (c) 2026 Diffbot. MIT License (recipe LICENSE). Uses device code from ExLlamaV3 (kernels/xmoe, MIT, see
++// DS4.1-Flash-1017 TP3 (2026-10-17): adapted from diffbot's xmoe_do -- empty jobs exit at once (fixed-size,
++// device-built job lists need no host sync), rows of the padded-token sentinel expert are skipped, K4/K3 mul1 instances.
++// Copyright (c) 2026 Diffbot. MIT License (LICENSE). Uses device code from ExLlamaV3 (kernels/xmoe, MIT, see
+ // kernels/xmoe/LICENSE.exllamav3): the EXL3 trellis decoder (dq_dispatch), mma/ldmatrix/cp.async helpers and the 128-point
+ // Hadamard device functions. Build: kernels/build.sh (-> kernels/build/xmoe_do), loaded by the patched vllm-exl3 plugin when EXL3_DO=1.
+ // xmoe_do (2026-10-01, DS4.1 lever 2): decode-once grouped GEMM for EXL3 MoE experts with many rows (prefill).
+@@ -31,6 +33,7 @@
+     const int n_tile = blockIdx.x;
+     const int row0 = job_row0[job];
+     const int rows = job_rows[job];
++    if (rows <= 0) return;  // padding job of a fixed-size, device-built job list
+     const uint16_t* trellis = reinterpret_cast<const uint16_t*>(job_trellis[job]);
+     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+     const int blocks_n = N / 16;
+@@ -128,9 +131,8 @@
+     dim3 grid(N / 128, J);
+     #define LAUNCH(B, CB, OH) do_gemm_kernel<B, CB, 128, 128, OH><<<grid, 256, 0, stream>>>( \
+         (const half*) A.data_ptr(), C, job_row0.data_ptr<int>(), job_rows.data_ptr<int>(), job_trellis.data_ptr<int64_t>(), K, N)
+-    if (bits == 3 && cb == 2) { if (out_half) LAUNCH(3, 2, true); else LAUNCH(3, 2, false); }
+-    else if (bits == 3 && cb == 1) { if (out_half) LAUNCH(3, 1, true); else LAUNCH(3, 1, false); }
+-    else if (bits == 2 && cb == 1) { if (out_half) LAUNCH(2, 1, true); else LAUNCH(2, 1, false); }
++    if (bits == 4 && cb == 2) { if (out_half) LAUNCH(4, 2, true); else LAUNCH(4, 2, false); }
++    else if (bits == 3 && cb == 2) { if (out_half) LAUNCH(3, 2, true); else LAUNCH(3, 2, false); }
+     else TORCH_CHECK(false, "unsupported bits/cb");
+     #undef LAUNCH
+ }
+@@ -149,12 +151,13 @@
+ 
+ __global__ void k_gather_had(const half* __restrict__ x, const int64_t* __restrict__ tok, const int* __restrict__ row_exp,
+                              const int64_t* __restrict__ suh_g, const int64_t* __restrict__ suh_u, half* __restrict__ xg,
+-                             half* __restrict__ xu, int R, int hidden, bool gated)
++                             half* __restrict__ xu, int R, int hidden, bool gated, int n_exp)
+ {
+     const int wpt = hidden / 128;
+     const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+     if (w >= R * wpt) return;
+     const int r = w / wpt, off = w % wpt, e = row_exp[r];
++    if (e < 0 || e >= n_exp) return;
+     const half* in = x + tok[r] * hidden + off * 128;
+     if (gated) had_hf_r_128_inner<true, false>(in, xg + (size_t)r * hidden + off * 128, (const half*) suh_g[e] + off * 128, HSCALE);
+     had_hf_r_128_inner<true, false>(in, xu + (size_t)r * hidden + off * 128, (const half*) suh_u[e] + off * 128, HSCALE);
+@@ -162,12 +165,13 @@
+ 
+ __global__ void k_guad(half* __restrict__ cg, const half* __restrict__ cu, const int* __restrict__ row_exp,
+                        const int64_t* __restrict__ svh_g, const int64_t* __restrict__ svh_u, const int64_t* __restrict__ suh_d,
+-                       int R, int inter, float act_limit, int act_fn)
++                       int R, int inter, float act_limit, int act_fn, int n_exp)
+ {
+     const int wpt = inter / 128;
+     const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+     if (w >= R * wpt) return;
+     const int r = w / wpt, off = w % wpt, e = row_exp[r];
++    if (e < 0 || e >= n_exp) return;
+     const size_t o = (size_t)r * inter + off * 128;
+     had_hf_r_128_guad_inner(cg + o, cu + o, cg + o, (const half*) svh_g[e] + off * 128, (const half*) svh_u[e] + off * 128,
+                             (const half*) suh_d[e] + off * 128, HSCALE, act_limit, act_fn);
+@@ -175,16 +179,18 @@
+ 
+ __global__ void k_d_out(const half* __restrict__ d, float* __restrict__ out, const int64_t* __restrict__ tok,
+                         const half* __restrict__ wts, const int* __restrict__ row_exp, const int64_t* __restrict__ svh_d,
+-                        int R, int hidden)
++                        int R, int hidden, int n_exp)
+ {
+     const int wpt = hidden / 128;
+     const int w = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+     if (w >= R * wpt) return;
+     const int r = w / wpt, off = w % wpt, e = row_exp[r];
++    if (e < 0 || e >= n_exp) return;
+     had_hf_r_128_d_inner(d + (size_t)r * hidden + off * 128, out + tok[r] * hidden + off * 128,
+                          (const half*) svh_d[e] + off * 128, HSCALE * __half2float(wts[r]));
+ }
+ 
++// Rows whose expert is outside [0, n_exp) (the padded-token sentinel) are skipped.
+ // out[T, hidden] fp32 += big-expert MoE for rows (tok, wts, row_exp) grouped by expert into jobs (job_row0, job_rows, job_exp).
+ // Pointer tables are the plugin's per-expert int64 device tensors. Scratch: xg, xu [R, hidden] fp16; cg, cu [R, inter] fp16.
+ // The down output reuses xg.
+@@ -193,7 +199,7 @@
+             torch::Tensor g_tr, torch::Tensor g_suh, torch::Tensor g_svh, torch::Tensor u_tr, torch::Tensor u_suh, torch::Tensor u_svh,
+             torch::Tensor d_tr, torch::Tensor d_suh, torch::Tensor d_svh,
+             torch::Tensor xg, torch::Tensor xu, torch::Tensor cg, torch::Tensor cu,
+-            int64_t bits, int64_t cb, double act_limit, int64_t act_fn)
++            int64_t bits, int64_t cb, double act_limit, int64_t act_fn, int64_t n_exp)
+ {
+     const at::cuda::OptionalCUDAGuard guard(device_of(x));
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+@@ -205,15 +211,15 @@
+     const int T = 256;
+     auto blocks = [&](int warps) { return (warps * 32 + T - 1) / T; };
+     k_gather_had<<<blocks(R * (hidden / 128)), T, 0, stream>>>((const half*) x.data_ptr(), tok.data_ptr<int64_t>(), row_exp.data_ptr<int>(),
+-        g_suh.data_ptr<int64_t>(), u_suh.data_ptr<int64_t>(), (half*) xg.data_ptr(), (half*) xu.data_ptr(), R, hidden, gated);
++        g_suh.data_ptr<int64_t>(), u_suh.data_ptr<int64_t>(), (half*) xg.data_ptr(), (half*) xu.data_ptr(), R, hidden, gated, (int) n_exp);
+     auto xg_v = xg.narrow(0, 0, R), xu_v = xu.narrow(0, 0, R);
+     if (gated) launch_do_gemm(xg_v, cg.data_ptr(), true, inter, job_row0, job_rows, jg, bits, cb, stream);
+     launch_do_gemm(xu_v, cu.data_ptr(), true, inter, job_row0, job_rows, ju, bits, cb, stream);
+     k_guad<<<blocks(R * (inter / 128)), T, 0, stream>>>((half*) cg.data_ptr(), (const half*) cu.data_ptr(), row_exp.data_ptr<int>(),
+-        g_svh.data_ptr<int64_t>(), u_svh.data_ptr<int64_t>(), d_suh.data_ptr<int64_t>(), R, inter, (float) act_limit, (int) act_fn);
++        g_svh.data_ptr<int64_t>(), u_svh.data_ptr<int64_t>(), d_suh.data_ptr<int64_t>(), R, inter, (float) act_limit, (int) act_fn, (int) n_exp);
+     launch_do_gemm(cg.narrow(0, 0, R), xg.data_ptr(), true, hidden, job_row0, job_rows, jd, bits, cb, stream);
+     k_d_out<<<blocks(R * (hidden / 128)), T, (T / 32) * 128 * sizeof(float), stream>>>((const half*) xg.data_ptr(), out.data_ptr<float>(),
+-        tok.data_ptr<int64_t>(), (const half*) wts.data_ptr(), row_exp.data_ptr<int>(), d_svh.data_ptr<int64_t>(), R, hidden);
++        tok.data_ptr<int64_t>(), (const half*) wts.data_ptr(), row_exp.data_ptr<int>(), d_svh.data_ptr<int64_t>(), R, hidden, (int) n_exp);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
