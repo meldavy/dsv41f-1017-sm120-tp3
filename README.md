@@ -14,7 +14,7 @@ in VRAM, and the Engram n-gram tables live in host RAM.
 | | |
 |---|---|
 | Prefill | ~7,000 tok/s at 10k-token prompts, ~7,600 at 32k, 5,400 at 736k |
-| Decode | ~91.5 tok/s without speculation; 150-260 tok/s with DSpark (see [Speculative decoding](#speculative-decoding-dspark)) |
+| Decode | ~91.5 tok/s without speculation; 150-260 tok/s with DSpark on realistic outputs (see [Speculative decoding](#speculative-decoding-dspark)) |
 | Context / KV | 1,048,576-token window, 3.14M-token KV pool (3 concurrent 1M sessions) |
 
 The patches and scripts are in this repository (`patches/`, `scripts/`) and also reproduced in the appendices.
@@ -352,7 +352,7 @@ in one pass):
 | Prefill, 32k-token prompt | **7,546-7,597 tok/s** | 6,815-6,818 tok/s (−10%) |
 | Decode after 10k prompt, synthetic filler text | 91.5-91.7 tok/s | 133.7-149.9 tok/s (+46-64%) |
 | Decode after 32k prompt, synthetic filler text | 91.5-91.7 tok/s | 152.8-166.5 tok/s (+67-82%) |
-| Decode, realistic outputs: Python module + tests / Rust parser / TCP explainer / refactor (600 tokens each) | not measured | 207.6-213.3 / 240.5-260.8 / 151.5-160.4 / 178.2-189.7 tok/s |
+| Decode, realistic outputs: Python module + tests / Rust parser / TCP explainer / refactor (600 tokens each) | not measured | 207.6-213.3 / 240.5-260.4 / 151.5-158.2 / 178.2-184.4 tok/s |
 | Mean acceptance length | — | 2.5-4.1 tokens per verify step |
 
 Notes:
